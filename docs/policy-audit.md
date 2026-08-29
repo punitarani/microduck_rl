@@ -338,3 +338,93 @@ position-servo artefact and should not be quoted.
    actuator or route the eval through mjlab. This is the single highest-value
    piece of engineering here, because it makes every future number trustworthy.
 6. **Backlash twins, rough terrain, long-horizon** — all untested.
+
+
+---
+
+# Round 3 — headstand solved statically, eval ported to BAM
+
+Both $0. No training was run.
+
+## Is a headstand physically possible? Yes, but it is an inverted pendulum
+
+`scripts/headstand_feasibility.py` searches for a symmetric inverted pose that
+is balanced, stacked and torque-feasible, then applies AGENTS.md's own settle
+test: command the pose and see whether it survives 3 s from noisy inits.
+
+| question | answer |
+|---|---|
+| geometry — can the trunk sit 8 cm above the beak? | **yes**, a rigid inversion gives 10.8 cm; the solver found 13.7 cm |
+| statics — is there a balanced pose within torque? | **yes**, CoM offset 0.00 cm at **0.140 Nm peak, 22% of the 0.641 Nm ceiling** |
+| stability — does it hold open-loop? | **no**, all 5 settle trials collapse to ~2 cm stack and 82-101° tilt |
+
+**Strength is not the limit.** The robot has 4.5x the torque it needs. The pose
+rests on a SINGLE contact point, so a headstand here is an inverted pendulum:
+possible, but requiring active feedback balancing rather than a pose to hold.
+
+Both reward designs treated it as a pose-holding task — `headstand_hold` pays
+for being in the posture and nothing pays for the corrective control that keeps
+it there. That is why the stacking gate was never satisfied in 2300 iterations:
+the gate was right, and there was no gradient toward the only strategy that can
+clear it.
+
+*A bug worth recording:* the first version of this script loaded
+`robot_allcollisions.xml` directly, which is the robot with NO ground plane. The
+robot was in free fall, free fall preserves pose perfectly for 3 s, and the
+script confidently reported "FEASIBLE — HELD" for all five trials. The
+`contacts: 0` line is what exposed it. Same failure mode as the rest of this
+audit: a metric that never checks the thing it is claiming.
+
+## The eval is now available on the real actuator
+
+`scripts/bam_eval.py` routes rollouts through the mjlab training env, so the
+actuator is not a model of BAM — it IS the `BamActuator` training uses.
+Many envs run in parallel, so every number arrives with an interval.
+
+Sprint, forced command 0.6 m/s, DR off to isolate the actuator, 32 envs:
+
+| policy | BAM vx | 95% CI | vs baseline |
+|---|---|---|---|
+| vendored `alpha_walking` | 0.237 | 0.219-0.255 | — |
+| sprint-steerable | 0.307 | 0.290-0.324 | +30% |
+| **sprint-fastest** | **0.366** | 0.349-0.382 | **+54%** |
+
+The intervals do not overlap, so the improvement is statistically solid.
+**+54% is the defensible headline**, replacing both the original +69%
+(position-servo artefact) and the earlier +46% point estimate. DR turns out to
+cost almost nothing under BAM (0.307 off vs 0.311 on), so the entire discrepancy
+was the actuator.
+
+Spin, 10 s, 32 envs, DR on:
+
+| policy | net rotation | no fall | all criteria |
+|---|---|---|---|
+| old (oscillating) | 0.15 rev (CI 0.08-0.21) | 100% | **FAIL** 0/32 rotate |
+| **new (direction-aware)** | **12.82 rev** (CI 12.57-13.07) | 100% | **PASS 32/32 on all three** |
+
+**The servo eval is not uniformly optimistic.** It overstated sprint speed by
+~36% and UNDERSTATED spin stability — it scored the new spin at 73% no-fall
+where BAM gives 100%. So "the deployment eval is optimistic" was itself too
+simple a claim: it is *wrong in different directions for different behaviours*,
+which is the argument for using the BAM path as the default rather than
+correcting the servo path by a fudge factor.
+
+Two bugs found while porting, both worth keeping:
+
+1. Stripping DR events orphaned the curricula that mutate them, which raised
+   `Event term 'randomize_com' not found in active terms` at reset. Curricula
+   are now removed with their events.
+2. The DR filter matched `expand_bam_friction_fields`, which is required BAM
+   plumbing rather than randomisation — BAM refuses to run without it. AGENTS.md
+   calls it out as mandatory for standalone env cfgs.
+
+## Final status after three rounds
+
+| policy | verdict | best evidence |
+|---|---|---|
+| **spin, two legs (direction-aware)** | **VALIDATED** | 12.82 rev/10 s, 32/32 on all criteria under BAM |
+| **sprint-fastest** | **VALIDATED, with a caveat** | 0.366 m/s under BAM, +54% vs baseline, CI-separated; but straight only 8% of the time |
+| **sprint-steerable** | **VALIDATED** | 0.307 m/s, 76% straight, best telemetry and current margin |
+| jump | not achieved | best is 8% >= 2 cm with 21% upright |
+| one-leg stand / spin | not achieved | 1-3% reach a 2 s hold; real holds only under a 10° IMU fault |
+| headstand | **possible, not achieved** | balanced pose exists at 22% of torque ceiling; it is an inverted pendulum and no reward attempted the balancing |
