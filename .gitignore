@@ -38,3 +38,9 @@ backup_onnx/
 logdir/.claude/
 logdir/
 logdir/.claude/worktrees/
+
+# Evaluation recordings and rollout artifacts (large, per-run)
+runs/
+
+# macOS
+.DS_Store
