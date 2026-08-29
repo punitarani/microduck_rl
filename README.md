@@ -54,6 +54,40 @@ uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096 \
 No GPU? Add `--hf-jobs` to any train command to run it on Hugging Face Jobs
 instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 
+### macOS simulator, and Modal training under a budget
+
+Training needs CUDA; the simulator does not. On an Apple Silicon Mac,
+[`sim.sh`](sim.sh) drives the ONNX policies in CPU MuJoCo:
+
+```bash
+./sim.sh            # walk / stand / sit / ground-pick / roulade / kicks
+./sim.sh roller     # roller-skate policies
+```
+
+It wraps `scripts/infer_policy.py` with the two things macOS needs and the
+upstream instructions don't cover: `mjpython` (`launch_passive` refuses to run
+under plain `python` — the viewer must own the main thread), and a `libpython`
+symlink that `mjpython` dlopens but a uv-created venv does not provide.
+
+[`modal_app.py`](modal_app.py) runs the same `uv run train` on a Modal GPU under
+a hard dollar cap. The cap is the Modal function `timeout`, derived from the
+machine's per-second price, so a run cannot outspend it:
+
+```bash
+python modal_app.py plan                                  # what a budget buys
+modal run modal_app.py::probe --gpus L4,L40S              # measure s/iter
+MICRODUCK_GPU=L40S modal run --detach modal_app.py::main  # train under the cap
+```
+
+Checkpoints land in a Modal Volume and survive the cap being hit; `modal volume
+get` brings them back for `scripts/export.py`, and `--resume-run` continues from
+the Volume, so several capped runs chain into one long one.
+
+Measured at 4096 envs on `Mjlab-Velocity-Flat-MicroDuck`: L4 3.07 s/iter,
+L40S 1.44 s/iter. Against the 4000–6000 iterations a gait needs (see
+[AGENTS.md](AGENTS.md)), $10 is enough for one — with less margin than the
+"1–2 h" above suggests.
+
 ## Tasks
 
 `uv run list-envs` prints the live registry. Flat/Rough variants exist where noted.
@@ -77,6 +111,8 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 | `Mjlab-RollerSlope-Flat-MicroDuck` | slope | Glide down slopes on rollers |
 | `Mjlab-RollerStandUp-Flat-MicroDuck` | flat | Stand up from the ground onto the wheels |
 | `Mjlab-Spin-Flat-MicroDuck` | flat | Fast spin in place on rollers |
+| `Mjlab-Sprint-Flat-MicroDuck` | flat | Straight-line top speed: the walking recipe with a forward-command curriculum instead of fixed ranges, to find the speed ceiling rather than assume it |
+| `Mjlab-Jump-Flat-MicroDuck` | flat | Maximise peak trunk height in a genuine flight phase (both feet off, upright); pays only for beating the episode's own record |
 
 At deployment the runtime hot-swaps these policies (walk / recover / trick)
 behind a shared 61-dimensional observation contract, so any of them can take
