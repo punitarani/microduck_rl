@@ -203,3 +203,138 @@ down" is threshold-dependent and should be stated with its threshold.
   and integrator effects over minutes are unknown.
 - **Sensor noise model is coarse.** Gaussian on gyro and joint velocity plus a
   fixed IMU tilt; the real IMU has bias drift and the encoders quantise.
+
+
+---
+
+# Round 2 — results of the four evidence-backed fixes
+
+$15 spent on four retrains, each targeting a specific diagnosis. **One worked.**
+
+| fix | change | outcome |
+|---|---|---|
+| **spin** | project yaw onto the COMMANDED direction in both rewards | **WORKS** — net rotation 0.04 -> **9.55 revolutions** / 10 s |
+| jump | swap in the all-collisions robot so landings are physical | partial — "ends upright" 0% -> 21%, still fails |
+| one-leg | support weight 6 -> 20, action-rate tax 600/1200 -> 1500/3000 | partial — median hold 0.21 s -> 0.72 s, still fails |
+| headstand | stacking gate (trunk >= 8 cm above head) + stack shaping | **no effect** — still a tripod, stacked hold 0.00 s |
+
+## spin — fixed, and the fix revealed an honest trade
+
+| | run 1 (oscillating) | run 2 (direction-aware) |
+|---|---|---|
+| mean signed yaw rate | +0.03 rad/s | **+6.00 rad/s** |
+| net rotation / 10 s | 0.04 rev | **+9.55 rev** |
+| net rotation >= 1.5 rev (152 trials) | ~0% | **85%** (CI 78-90%) |
+| no fall | 91% | **73%** (CI 65-79%) |
+| max tilt <= 15° | 84% | 60% |
+
+It now genuinely rotates, and it is less stable for it — because a rotating biped
+must step, and stepping while turning is harder than standing still. Run 1's
+excellent stability was a consequence of not rotating.
+
+It falls 8/8 at foot friction 1.3, which is INSIDE the training range and which
+run 1 handled. That is a real regression and the top item for round 3: rotating
+requires the foot to slip, and high friction turns a pivot into a trip.
+
+**One acceptance criterion was wrong and has been changed**, which is worth
+flagging explicitly since changing criteria after seeing results is usually how
+people fool themselves. The original required double-support >= 80%. A biped
+cannot rotate with both feet planted without slipping, so that criterion
+encoded a physical impossibility — and run 1 passed it at 94% *precisely
+because* it was not rotating. It now guards against what it was actually for:
+airborne <= 20%, i.e. not hopping.
+
+## jump — hypothesis contradicted
+
+The all-collisions swap was the leading root-cause hypothesis: no trunk contact
+meant a bad landing had nothing to catch it. With physical landings the jump
+still fails.
+
+| version | >= 2 cm | ends upright |
+|---|---|---|
+| v2 (episode-max) | 1% | 91% |
+| v3/v4 (per-flight peak^2) | 70% | **0%** |
+| v5 (+ all-collisions) | 8% | 21% |
+
+152/152 still fall, median at 0.6 s. The contact model was a real defect and
+fixing it helped (0% -> 21% upright), but it was not the cause. The cause is
+still the objective: a squared per-flight payout makes aggression profitable,
+telemetry shows 63% joint saturation and 86% left/right load asymmetry, and no
+counterweight tried so far outbids it.
+
+## one-leg — improved, and diagnosed properly at last
+
+Median longest hold 0.21 s (run 1) -> **0.72 s** (run 3), against a 2.0 s
+criterion. 1/152 trials pass. But the distribution is the interesting part:
+
+| condition | mean hold | max |
+|---|---|---|
+| **imu_tilt_10deg (BEYOND range)** | **2.77 s** | **10.51 s** |
+| every other condition | 0.48-1.27 s | ~0.9 s |
+
+Under nominal, friction and mass conditions the hold is EXACTLY 0.72 s in every
+seed — deterministic, i.e. a single weight-shift transient at the start and then
+a settle onto two feet. The only thing that produces a real hold is a **10°
+IMU misalignment**, which biases perceived gravity, makes the robot lean, and
+unloads a foot as a side effect.
+
+So the policy has not learned to balance on one leg. It has learned to stand,
+and a sensor error occasionally tips it into a lean that happens to satisfy the
+gate. That is a much sharper diagnosis than "it does not transfer".
+
+## headstand — the gate works, the policy cannot clear it
+
+`headstand_hold` read 0.0000 for all 2300 iterations: the stacking gate was
+never once satisfied. Final policy: inversion +0.078 m (it does invert), head on
+the floor, but **trunk only 3.6 cm above the head** against the 8 cm the gate
+requires, and a stacked hold of 0.00 s.
+
+The gate is doing its job — it refuses to pay for the tripod that run 1 was
+rewarded for. What it does not do is provide a route to the real posture, and
+`headstand_stack_progress` at weight 60 was not enough to find one. Whether an
+800 g robot with a head that is 38% of its mass and no arms CAN stack its trunk
+over its beak is now the open question, and it is a physics question, not a
+reward question.
+
+---
+
+# Final state: the best validated configuration
+
+| policy | file | status | evidence |
+|---|---|---|---|
+| **sprint (steerable)** | `runs/BEST/sprint-steerable.onnx` | **ship** | 84% no-fall, 76% straight, 78% speed; best on saturation, jitter, current margin and action extremity |
+| **spin (two-leg)** | `runs/v15-spin2-v2/policy.onnx` | **use, with caveats** | 85% achieve >= 1.5 rev; 73% no-fall; fails at friction >= 1.3 |
+| sprint (fastest) | `runs/BEST/sprint-fastest.onnx` | fast, not straight | 82% no-fall, **8%** straight |
+| jump | — | **not achieved** | best of five designs: 8% reach 2 cm with 21% upright, or 1% reach 2 cm with 91% upright |
+| one-leg stand | — | **not achieved** | 1% reach a 2 s hold; real holds only under a 10° IMU fault |
+| one-leg spin | — | **not achieved** | 3% reach a 2 s hold |
+| headstand | — | **not achieved** | inverts but never stacks; 0.00 s stacked hold |
+
+Honest speed number for the sprint, measured under BAM with policy and baseline
+matched: **0.371 m/s vs 0.254 m/s, +46%.** The 0.758 m/s figure is a
+position-servo artefact and should not be quoted.
+
+## Exact next tests, in priority order
+
+1. **Spin at high friction** ($2, 30 min). Add foot-friction curriculum up to
+   1.5 during spin training, or add a slight foot-yaw compliance. Acceptance:
+   no-fall >= 85% at friction 1.3, net rotation >= 1.5 rev retained.
+2. **One-leg reverse curriculum** ($3). AGENTS.md's prescribed fix for "learns
+   the start, never the last mile": spawn a fraction of episodes ALREADY
+   balanced on one foot so the policy gets on-policy data in the hold state,
+   which it currently never visits. Acceptance: median hold >= 1.5 s under
+   nominal, and long holds no longer exclusive to the IMU-fault condition.
+3. **Is the headstand physically possible?** ($0). Before spending anything on
+   reward design, solve for a static equilibrium: place the robot beak-down with
+   the trunk stacked and check whether any joint configuration holds it with
+   torques inside the XL330 limit. If none exists, the task is impossible and
+   should be closed rather than retrained.
+4. **Jump: drop the squared payout** ($3). Evidence says the exponent is the
+   problem, not the counterweight — three different counterweights failed.
+   Try linear per-flight payout plus a hard termination on tilt > 45° during
+   flight. Acceptance: >= 2 cm with >= 80% ending upright.
+5. **BAM-faithful deployment eval** ($0, ~half a day). The 36% speed gap means
+   every deployment number is optimistic. Either port `infer_policy` to the BAM
+   actuator or route the eval through mjlab. This is the single highest-value
+   piece of engineering here, because it makes every future number trustworthy.
+6. **Backlash twins, rough terrain, long-horizon** — all untested.

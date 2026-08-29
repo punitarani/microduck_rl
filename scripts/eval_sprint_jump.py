@@ -223,7 +223,7 @@ def run_headstand(policy_path: str, seconds: float, record: str | None = None) -
     _reset_to_stance(model, data, policy)
     policy.vel_cmd[:] = 0.0
 
-    inversions, head_zs = [], []
+    inversions, head_zs, stacks = [], [], []
     hold = best_hold = 0.0
     for k in range(int(seconds / TIMESTEP)):
         if k % CONTROL_DECIMATION == 0:
@@ -234,9 +234,14 @@ def run_headstand(policy_path: str, seconds: float, record: str | None = None) -
         head_z = _site_z(model, data, "mouth_tip")
         feet_z = (_site_z(model, data, "left_foot") + _site_z(model, data, "right_foot")) / 2
         inv = feet_z - head_z
+        trunk_above = float(data.xpos[trunk][2]) - head_z
         inversions.append(inv)
         head_zs.append(head_z)
-        if inv > 0.05 and head_z < 0.06:
+        stacks.append(trunk_above)
+        # The STACKING term is what separates a headstand from a faceplant with
+        # the legs sprawled up. Without it this eval called a tripod — 2.91 N on
+        # the head, 4.29 N across both hips — an 11.7 s headstand.
+        if inv > 0.05 and head_z < 0.06 and trunk_above > 0.08:
             hold += TIMESTEP
             best_hold = max(best_hold, hold)
         else:
@@ -247,11 +252,14 @@ def run_headstand(policy_path: str, seconds: float, record: str | None = None) -
     print(f"  final                : {inv[-1]:+.3f} m")
     print(f"  best                 : {inv.max():+.3f} m")
     print(f"  mean over last 3 s   : {inv[-int(3 / TIMESTEP):].mean():+.3f} m")
+    st = np.array(stacks)
     print(f"head height final      : {head_zs[-1] * 100:.1f} cm")
+    print(f"trunk ABOVE head       : final {st[-1] * 100:+.1f} cm, best {st.max() * 100:+.1f} cm "
+          f"(needs >= 8 cm to be a stack rather than a sprawl)")
     print(f"time inverted (>0.05)  : {(inv > 0.05).mean() * 100:.0f}% of rollout")
     print(f"longest headstand hold : {best_hold:.2f}s")
     print(f"VERDICT                : "
-          f"{'HEADSTAND held' if best_hold >= 1.0 else 'passes through inversion' if inv.max() > 0.05 else 'never inverts'}")
+          f"{'HEADSTAND held (stacked)' if best_hold >= 1.0 else 'INVERTED BUT NOT STACKED — faceplant/tripod' if inv.max() > 0.05 else 'never inverts'}")
     rec.close()
     return 0
 

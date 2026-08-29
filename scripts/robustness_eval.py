@@ -313,7 +313,13 @@ ACCEPTANCE: dict[str, list[Criterion]] = {
         # 6.5 rad/s while turning 0.04 revolutions in 10 s.
         Criterion("net_spin", "net rotation >= 1.5 rev in 12 s",
                   lambda r: abs(r["net_rev"]) >= 1.5),
-        Criterion("grounded", "double-support >= 80%", lambda r: r["double_frac"] >= 0.80),
+        # WAS "double-support >= 80%". That criterion was wrong on physics, not
+        # on the policy: a biped cannot rotate with both feet planted without
+        # slipping, so it has to step. The run-1 spin passed it at 94% precisely
+        # BECAUSE it was not rotating. What the criterion was really guarding
+        # against is hopping, so it guards against that directly now.
+        Criterion("grounded", "airborne <= 20% (not hopping)",
+                  lambda r: r["airborne_frac"] <= 0.20),
         Criterion("tilt", "max trunk tilt <= 15 deg", lambda r: r["max_tilt"] <= 15.0),
     ],
     "headstand": [
