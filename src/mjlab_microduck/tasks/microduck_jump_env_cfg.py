@@ -49,6 +49,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers import CurriculumTermCfg, RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
+from mjlab_microduck.robot.microduck_constants import MICRODUCK_STANDUP_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
     MicroduckRlCfg,
@@ -107,6 +108,15 @@ JUMP_PEAK_METRIC_WEIGHT = 0.02
 def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     """Velocity env with a jump objective replacing the gait objective."""
     cfg = make_microduck_velocity_env_cfg(play=play)
+
+    # The walking robot has exactly two colliding geoms and both are feet, so a
+    # bad landing has nothing to catch it: the trunk passes through the floor and
+    # the robot keeps tipping. Measured consequence — 0/152 trials ended upright
+    # across every condition, and a fallen robot reads as 91% "airborne" because
+    # its feet are simply off the ground. Every task in this repo that meets the
+    # ground (standup, roulade, sitstand) uses the all-collisions model; the jump
+    # needed it too and inherited the walking one by default.
+    cfg.scene.entities = {"robot": MICRODUCK_STANDUP_ROBOT_CFG}
 
     trunk = SceneEntityCfg("robot", body_names=("trunk_base",))
 

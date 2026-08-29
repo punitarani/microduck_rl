@@ -7584,7 +7584,17 @@ def sustained_single_support(
 
 
 def _headstand_geometry(env, head_cfg: SceneEntityCfg, feet_cfg: SceneEntityCfg):
-    """(inversion, head_height): feet-above-head, and how low the head is."""
+    """(inversion, head_height, trunk_above_head).
+
+    The third value exists because the first two are not enough, which a video
+    made obvious: a robot that faceplants with its legs sprawled up has its feet
+    above its head and its head on the floor, and scores a perfect headstand.
+    Measured on the run-1 policy, the load was 2.91 N on the head and 4.29 N
+    across BOTH HIPS — a tripod, not a stand.
+
+    A real headstand STACKS: head on the floor, trunk well above it, feet above
+    that. `trunk_above_head` is what tells the two apart (3.4 cm in the tripod,
+    ~10-13 cm stacked)."""
     asset: Entity = env.scene[head_cfg.name]
     ground = env.scene.terrain.env_origins[:, 2]
     head_z = torch.nan_to_num(
@@ -7593,7 +7603,10 @@ def _headstand_geometry(env, head_cfg: SceneEntityCfg, feet_cfg: SceneEntityCfg)
     feet_z = torch.nan_to_num(
         asset.data.site_pos_w[:, feet_cfg.site_ids, 2].mean(dim=1) - ground, nan=0.0
     )
-    return feet_z - head_z, head_z
+    trunk_z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - ground, nan=0.0
+    )
+    return feet_z - head_z, head_z, trunk_z - head_z
 
 
 def headstand_progress(
@@ -7609,7 +7622,7 @@ def headstand_progress(
     maneuver — which matters because a headstand has no partial credit
     otherwise: every intermediate pose is just falling over.
     """
-    inversion, _ = _headstand_geometry(env, head_cfg, feet_cfg)
+    inversion, _, _ = _headstand_geometry(env, head_cfg, feet_cfg)
     pot = torch.clamp(inversion, max=ceiling)
     if not hasattr(env, "_headstand_prev") or env._headstand_prev.shape[0] != pot.shape[0]:
         env._headstand_prev = pot.clone()
@@ -7626,6 +7639,7 @@ def headstand_hold(
     feet_cfg: SceneEntityCfg,
     min_inversion: float = 0.05,
     max_head_height: float = 0.06,
+    min_trunk_above_head: float = 0.08,
     hold_target_s: float = 2.0,
 ) -> torch.Tensor:
     """Sustained credit for actually being in a headstand, in [0, 1].
@@ -7636,8 +7650,10 @@ def headstand_hold(
     same reason the one-leg trick pays for holding: an instantaneous gate is
     satisfied by passing through.
     """
-    inversion, head_z = _headstand_geometry(env, head_cfg, feet_cfg)
-    ok = (inversion > min_inversion) & (head_z < max_head_height)
+    inversion, head_z, trunk_above = _headstand_geometry(env, head_cfg, feet_cfg)
+    # The stacking gate is the one that rejects a faceplant-with-legs-up.
+    ok = ((inversion > min_inversion) & (head_z < max_head_height)
+          & (trunk_above > min_trunk_above_head))
     n = ok.shape[0]
     if not hasattr(env, "_headstand_hold") or env._headstand_hold.shape[0] != n:
         env._headstand_hold = torch.zeros(n, device=ok.device)
@@ -7655,5 +7671,27 @@ def headstand_inversion_metric(
 ) -> torch.Tensor:
     """Feet-above-head in metres. Metric term — weight small but NON-ZERO, or
     Episode_Reward logs the weighted value and it reads 0.0000 forever."""
-    inversion, _ = _headstand_geometry(env, head_cfg, feet_cfg)
+    inversion, _, _ = _headstand_geometry(env, head_cfg, feet_cfg)
     return inversion
+
+
+def headstand_stack_progress(
+    env: ManagerBasedRlEnv,
+    head_cfg: SceneEntityCfg,
+    feet_cfg: SceneEntityCfg,
+    ceiling: float = 0.13,
+) -> torch.Tensor:
+    """Potential-based Delta(trunk above head), the axis the tripod cheats on.
+
+    Inversion alone rose to +0.12 m while the trunk stayed 3.4 cm off the floor.
+    Shaping the STACK gives the policy a gradient out of the tripod instead of a
+    gate it can sit just outside of."""
+    _, _, trunk_above = _headstand_geometry(env, head_cfg, feet_cfg)
+    pot = torch.clamp(trunk_above, max=ceiling)
+    if not hasattr(env, "_headstack_prev") or env._headstack_prev.shape[0] != pot.shape[0]:
+        env._headstack_prev = pot.clone()
+    fresh = env.episode_length_buf <= 1
+    env._headstack_prev[fresh] = pot[fresh]
+    delta = pot - env._headstack_prev
+    env._headstack_prev = pot.clone()
+    return delta

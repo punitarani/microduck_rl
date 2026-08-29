@@ -6,9 +6,13 @@ floor, which is fine when falling is cheap and fatal when the whole task is to
 balance on your head. This swaps in the all-collisions model the standup family
 uses (11 colliding geoms), which is a one-line entity swap rather than a fork.
 
-Measured as **feet above head**, not by trunk orientation. A robot lying on its
-back is "inverted" by any tilt measure while being nowhere near a headstand;
-feet above head with the head on the floor is a shape only a headstand has.
+Measured as a STACK — head on the floor, trunk well above it, feet above that.
+Trunk tilt alone is useless (a robot on its back is "inverted" by any tilt
+measure), and feet-above-head plus a low head is not enough either: run 1
+satisfied exactly that by faceplanting with its legs sprawled up, resting 2.91 N
+on its head and 4.29 N across BOTH HIPS with the trunk 3.4 cm off the floor. It
+scored a 11.7 s "headstand". The stacking gate is what tells a stand from a
+tripod, and it was added only after the video was watched.
 
 Two terms, mirroring what the other tricks needed:
 
@@ -21,11 +25,10 @@ Two terms, mirroring what the other tricks needed:
   already demonstrated that an instantaneous gate gets satisfied by passing
   through it rather than by holding it.
 
-Honest expectation: this is the least likely of the tricks to succeed. An 800 g
-biped with 14 low-torque hobby servos and a head that is ~38% of its mass has to
-get inverted and then balance there. It is authored, smoke-tested and given a
-small budget; if it does not converge, the interesting artefact is the measured
-inversion curve rather than a policy.
+Honest expectation: hard. An 800 g biped with 14 low-torque hobby servos and a
+head that is ~38% of its mass has to invert and then balance on a small contact
+patch. Run 1 proved it can get inverted; whether it can STACK and hold there is
+what run 2 tests.
 """
 
 import dataclasses
@@ -50,6 +53,12 @@ FOOT_SITES = ("left_foot", "right_foot")
 # Standing measures about -0.19; a clean headstand about +0.17.
 HEADSTAND_MIN_INVERSION = 0.05
 HEADSTAND_MAX_HEAD_HEIGHT = 0.06
+# Run 1 satisfied "feet above head, head on floor" by faceplanting with its legs
+# sprawled up: 2.91 N on the head and 4.29 N across both hips, trunk only 3.4 cm
+# off the floor. A real headstand STACKS head -> trunk -> feet, so the trunk has
+# to be well clear of the head. 8 cm rejects that tripod and admits a stack.
+HEADSTAND_MIN_TRUNK_ABOVE_HEAD = 0.08
+HEADSTAND_STACK_WEIGHT = 60.0
 HEADSTAND_HOLD_TARGET_S = 2.0
 HEADSTAND_PROGRESS_WEIGHT = 60.0
 HEADSTAND_HOLD_WEIGHT = 8.0
@@ -99,8 +108,16 @@ def make_microduck_headstand_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
             **geom,
             "min_inversion": HEADSTAND_MIN_INVERSION,
             "max_head_height": HEADSTAND_MAX_HEAD_HEIGHT,
+            "min_trunk_above_head": HEADSTAND_MIN_TRUNK_ABOVE_HEAD,
             "hold_target_s": HEADSTAND_HOLD_TARGET_S,
         },
+    )
+    # Shape the axis the tripod cheated on, so there is a gradient out of it
+    # rather than a gate the policy can sit just outside.
+    cfg.rewards["headstand_stack"] = RewardTermCfg(
+        func=microduck_mdp.headstand_stack_progress,
+        weight=HEADSTAND_STACK_WEIGHT,
+        params=geom,
     )
     cfg.rewards["inversion_m"] = RewardTermCfg(
         func=microduck_mdp.headstand_inversion_metric,

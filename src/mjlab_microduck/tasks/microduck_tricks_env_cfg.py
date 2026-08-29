@@ -58,6 +58,14 @@ SUPPORT_MIN_HEIGHT = 0.10
 # 0.21 s, so 2 s is a real target rather than a formality.
 ONE_LEG_HOLD_TARGET_S = 2.0
 
+# Run 1 never produced a hold: 0/16 envs reached 2 s under BAM in the training
+# env, and 0% single-support when exported. The reward was not wrong, it was
+# OUTBID. At weight 6 and a measured hold value near 0.2, holding paid ~1.2
+# while a plain two-foot stance collected upright (2.0) plus both tracking terms
+# (2.0) for free. Standing still was the better deal, and the policy took it.
+# At 20 a sustained hold is worth more than everything a stance earns.
+ONE_LEG_SUPPORT_WEIGHT = 20.0
+
 # Brisk but holdable. Above ~5 rad/s this robot is tumbling, not spinning.
 SPIN_TARGET_RATE = 4.0
 
@@ -131,7 +139,7 @@ def make_microduck_trick_env_cfg(trick: str, play: bool = False) -> ManagerBased
         # The one-leg gate is the whole trick and is hard to satisfy, so it
         # carries the stack. The two-leg gate is nearly free while standing, so
         # it is only a guard against the spin becoming a fall.
-        weight=6.0 if one_leg else 1.0,
+        weight=ONE_LEG_SUPPORT_WEIGHT if one_leg else 1.0,
         params=support_params,
     )
 
@@ -163,10 +171,14 @@ def make_microduck_trick_env_cfg(trick: str, play: bool = False) -> ManagerBased
             func=microduck_mdp.reward_weight,
             params={
                 "reward_name": "action_rate_l2",
+                # Pushed out from 600/1200: run 1's support metric peaked around
+                # iteration 660 and had collapsed by 1490, which is exactly where
+                # this tax was ramping. An attempt-tax arriving while the skill
+                # is still forming makes standing still win.
                 "weight_stages": [
                     {"step": 0, "weight": -0.005},
-                    {"step": 600 * 24, "weight": -0.02},
-                    {"step": 1200 * 24, "weight": -0.05},
+                    {"step": 1500 * 24, "weight": -0.02},
+                    {"step": 3000 * 24, "weight": -0.05},
                 ],
             },
         )

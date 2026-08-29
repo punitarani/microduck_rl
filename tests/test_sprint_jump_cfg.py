@@ -421,12 +421,13 @@ def test_headstand_hold_needs_both_gates(monkeypatch):
     calls = {}
 
     def fake_geom(env, head_cfg, feet_cfg):
-        return torch.tensor([calls["inv"]]), torch.tensor([calls["head_z"]])
+        return (torch.tensor([calls["inv"]]), torch.tensor([calls["head_z"]]),
+                torch.tensor([calls.get("stack", 0.11)]))
 
     monkeypatch.setattr(microduck_mdp, "_headstand_geometry", fake_geom)
     env = _FakeEnv(z=[0.1], airborne=[False])
     kw = dict(head_cfg=None, feet_cfg=None, min_inversion=0.05,
-              max_head_height=0.06, hold_target_s=2.0)
+              max_head_height=0.06, min_trunk_above_head=0.08, hold_target_s=2.0)
 
     calls.update(inv=0.15, head_z=0.20)  # inverted but head high: a somersault
     assert microduck_mdp.headstand_hold(env, **kw).item() == 0.0
@@ -448,3 +449,25 @@ def test_jump_keeps_upright_pressure_against_a_squared_payout():
     walk = make_microduck_velocity_env_cfg().rewards
     assert jump["upright"].weight > walk["upright"].weight
     assert jump["gentle_landing"].weight > 0
+
+
+def test_headstand_rejects_the_faceplant_tripod(monkeypatch):
+    """Run 1 scored a perfect headstand while resting on head AND both hips,
+    trunk 3.4 cm off the floor. Feet-above-head plus a low head does not
+    distinguish a stand from a faceplant with the legs sprawled up; only the
+    stacking gate does."""
+    state = {}
+    monkeypatch.setattr(microduck_mdp, "_headstand_geometry",
+                        lambda e, h, f: (torch.tensor([state["inv"]]),
+                                         torch.tensor([state["head"]]),
+                                         torch.tensor([state["stack"]])))
+    env = _FakeEnv(z=[0.1], airborne=[False])
+    kw = dict(head_cfg=None, feet_cfg=None, min_inversion=0.05,
+              max_head_height=0.06, min_trunk_above_head=0.08, hold_target_s=2.0)
+
+    # The measured run-1 tripod: inverted, head down, trunk only 3.4 cm up.
+    state.update(inv=0.123, head=0.001, stack=0.034)
+    assert microduck_mdp.headstand_hold(env, **kw).item() == 0.0, "tripod must score 0"
+    # A stacked headstand.
+    state.update(inv=0.15, head=0.02, stack=0.11)
+    assert microduck_mdp.headstand_hold(env, **kw).item() > 0.0
