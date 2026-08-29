@@ -471,3 +471,40 @@ def test_headstand_rejects_the_faceplant_tripod(monkeypatch):
     # A stacked headstand.
     state.update(inv=0.15, head=0.02, stack=0.11)
     assert microduck_mdp.headstand_hold(env, **kw).item() > 0.0
+
+
+def test_spin_rewards_require_net_rotation_not_oscillation(monkeypatch):
+    """The run-1 spin scored 6.48 rad/s of mean |yaw rate| while turning 0.04
+    revolutions in 10 s: it vibrated its yaw axis. A magnitude-only reward
+    cannot tell shaking from spinning; projecting onto the commanded direction
+    can, because a back-and-forth nets to zero over a cycle."""
+    class _Cmd:
+        def get_command(self, name):
+            return torch.tensor([[0.0, 0.0, 3.0]])  # commanded +yaw
+
+    env = _FakeEnv(z=[0.119], airborne=[False])
+    env.command_manager = _Cmd()
+
+    class _Asset:
+        class data:
+            root_link_ang_vel_w = torch.tensor([[0.0, 0.0, 0.0]])
+            root_link_quat_w = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+    cfg = type("Cfg", (), {"name": "robot"})()
+    env.scene._asset = _Asset
+    kw = dict(asset_cfg=cfg, target_rate=4.0)
+
+    _Asset.data.root_link_ang_vel_w = torch.tensor([[0.0, 0.0, 3.0]])
+    with_cmd = microduck_mdp.yaw_rate_capped(env, **kw).item()
+    _Asset.data.root_link_ang_vel_w = torch.tensor([[0.0, 0.0, -3.0]])
+    against = microduck_mdp.yaw_rate_capped(env, **kw).item()
+
+    assert with_cmd > 0.5, "turning the commanded way must pay"
+    assert against == 0.0, "turning the wrong way must pay nothing"
+    # Over one oscillation cycle the signed progress cancels; a magnitude-based
+    # term would have accumulated twice.
+    _Asset.data.root_link_ang_vel_w = torch.tensor([[0.0, 0.0, 3.0]])
+    fwd = microduck_mdp.spin_progress(env, asset_cfg=cfg).item()
+    _Asset.data.root_link_ang_vel_w = torch.tensor([[0.0, 0.0, -3.0]])
+    back = microduck_mdp.spin_progress(env, asset_cfg=cfg).item()
+    assert abs(fwd + back) < 1e-6, "a full shake cycle must net to zero"

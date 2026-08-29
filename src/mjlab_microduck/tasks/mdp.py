@@ -7443,37 +7443,55 @@ def yaw_rate_capped(
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     target_rate: float = 4.0,
     tilt_gate_deg: float = 30.0,
+    command_name: str = "twist",
 ) -> torch.Tensor:
-    """min(|yaw rate|, target) / target, zeroed unless upright. In [0, 1].
+    """Capped yaw rate IN THE COMMANDED DIRECTION, zeroed unless upright. [0, 1].
 
-    Capped on purpose. Uncapped |omega_z| is a jackpot: the fastest way to spin
-    a 25 cm biped is to fall over, and the playbook's own note that this robot
-    tumbles at 3.5-5.5 rad/s NATURALLY means an uncapped term pays most for
-    exactly the failure mode. Capping at a brisk-but-controlled rate makes
-    "spin and stay up" the argmax instead of "spin and go down".
+    Signed, and that is the whole point. The first version used |omega_z|, which
+    is satisfied just as well by oscillating as by turning — and that is exactly
+    what the policy learned: 6.48 rad/s of mean |yaw rate| and **0.04
+    revolutions of net rotation in 10 s**. It vibrated its yaw axis and scored a
+    perfect spin. Video showed a robot standing still.
+
+    Projecting onto the commanded direction means a wrong-way or back-and-forth
+    yaw earns nothing, so the only way to collect is to actually turn.
+
+    Still capped: uncapped rate is a jackpot, since the fastest way to spin a
+    25 cm biped is to fall over and this one tumbles at 3.5-5.5 rad/s naturally.
     """
     asset: Entity = env.scene[asset_cfg.name]
     wz = torch.nan_to_num(asset.data.root_link_ang_vel_w[:, 2], nan=0.0)
+    cmd = env.command_manager.get_command(command_name)
+    direction = torch.sign(cmd[:, 2])
+    # A near-zero command has no direction to reward; fall back to the sign of
+    # the motion so a standing env is not punished for being still.
+    direction = torch.where(direction.abs() < 0.5, torch.sign(wz), direction)
+    aligned = torch.clamp(wz * direction, min=0.0)
     upright, _ = _upright_mask(env, asset_cfg, tilt_gate_deg)
-    return (torch.clamp(wz.abs(), max=target_rate) / target_rate) * upright.float()
+    return (torch.clamp(aligned, max=target_rate) / target_rate) * upright.float()
 
 
 def spin_progress(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     tilt_gate_deg: float = 30.0,
+    command_name: str = "twist",
 ) -> torch.Tensor:
-    """Accumulated |yaw| turned this episode, paid as progress (radians/step).
+    """NET yaw turned in the commanded direction, in radians per step.
 
-    Potential-based in the same spirit as the jump record: it pays for turning
-    FURTHER, so holding still pays zero and there is no pose to park in. Kept
-    separate from the rate term so a policy can be rewarded for sustaining
-    rotation without also being paid for the violence of getting there.
+    Was |omega_z| * dt, which integrates oscillation into fictitious progress:
+    the measured policy accumulated an apparent 12.5 "revolutions" while its
+    integrated yaw ANGLE moved 0.04 of one. Signed and direction-projected, a
+    back-and-forth shake nets to zero over a cycle and only real rotation
+    accumulates.
     """
     asset: Entity = env.scene[asset_cfg.name]
     wz = torch.nan_to_num(asset.data.root_link_ang_vel_w[:, 2], nan=0.0)
+    cmd = env.command_manager.get_command(command_name)
+    direction = torch.sign(cmd[:, 2])
+    direction = torch.where(direction.abs() < 0.5, torch.sign(wz), direction)
     upright, _ = _upright_mask(env, asset_cfg, tilt_gate_deg)
-    return wz.abs() * upright.float() * env.step_dt
+    return wz * direction * upright.float() * env.step_dt
 
 
 def jump_flight_payout(

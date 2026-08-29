@@ -45,6 +45,7 @@ from eval_sprint_jump import (  # noqa: E402
     _trunk_body_id,
     _trunk_tilt_deg,
     _yaw_rate,
+    _yaw_angle,
     _build,
     _site_z,
 )
@@ -205,6 +206,8 @@ def rollout(policy_path: str, behavior: str, cond: Condition, seed: int,
     head0 = _site_z(model, data, "mouth_tip")
 
     speeds, yaws, tilts, invs = [], [], [], []
+    net_yaw = 0.0
+    prev_yaw = _yaw_angle(model, data)
     single = both = airborne = 0
     hold = best_hold = 0.0
     inv_hold = best_inv_hold = 0.0
@@ -231,6 +234,9 @@ def rollout(policy_path: str, behavior: str, cond: Condition, seed: int,
         tilts.append(tilt)
         speeds.append(_body_forward_speed(model, data))
         yaws.append(_yaw_rate(model, data))
+        cur_yaw = _yaw_angle(model, data)
+        net_yaw += (cur_yaw - prev_yaw + math.pi) % (2 * math.pi) - math.pi
+        prev_yaw = cur_yaw
 
         l, r = _foot_contacts(model, data)
         if l ^ r:
@@ -267,6 +273,8 @@ def rollout(policy_path: str, behavior: str, cond: Condition, seed: int,
         "vx": float(np.mean(speeds[steady] or speeds)),
         "yaw": float(np.mean(yaws[steady] or yaws)),
         "abs_yaw": float(np.mean(np.abs(yaws[steady] or yaws))),
+        "net_rev": net_yaw / (2 * math.pi),
+        "net_yaw_rate": net_yaw / max(seconds, 1e-9),
         "max_tilt": float(max(tilts)),
         "mean_tilt": float(np.mean(tilts)),
         "end_tilt": float(tilts[-1]),
@@ -301,7 +309,10 @@ ACCEPTANCE: dict[str, list[Criterion]] = {
     ],
     "spin2": [
         Criterion("upright", "does not fall in 12 s", lambda r: not r["fell"]),
-        Criterion("rate", "mean |yaw| >= 3.0 rad/s", lambda r: r["abs_yaw"] >= 3.0),
+        # NET rotation, not |rate|: the run-1 spin passed a |rate| criterion at
+        # 6.5 rad/s while turning 0.04 revolutions in 10 s.
+        Criterion("net_spin", "net rotation >= 1.5 rev in 12 s",
+                  lambda r: abs(r["net_rev"]) >= 1.5),
         Criterion("grounded", "double-support >= 80%", lambda r: r["double_frac"] >= 0.80),
         Criterion("tilt", "max trunk tilt <= 15 deg", lambda r: r["max_tilt"] <= 15.0),
     ],

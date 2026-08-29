@@ -136,6 +136,15 @@ def _trunk_tilt_deg(model, data) -> float:
     return float(np.degrees(np.arccos(np.clip(cos_tilt, -1.0, 1.0))))
 
 
+def _yaw_angle(model, data) -> float:
+    """Heading, from the trunk quaternion. Integrating the DIFFERENCE of this is
+    the only honest way to count revolutions."""
+    fj = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
+    adr = model.jnt_qposadr[fj]
+    w, x, y, z = data.qpos[adr + 3:adr + 7]
+    return float(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+
+
 def _yaw_rate(model, data) -> float:
     fj = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
     adr_v = model.jnt_dofadr[fj]
@@ -259,7 +268,11 @@ def run_trick(policy_path: str, kind: str, yaw_cmd: float, seconds: float,
     policy.vel_cmd[:] = np.array([0.0, 0.0, yaw_cmd], dtype=np.float32)
     single = both = airborne = 0
     run_len = best_run = 0
-    yaw_total = 0.0
+    # NET rotation, from the integrated yaw ANGLE. Summing |yaw rate| counts a
+    # back-and-forth shake as progress: the run-1 spin scored 12.5 "revolutions"
+    # that way while its actual heading moved 0.04 of one.
+    net_yaw = 0.0
+    prev_yaw = _yaw_angle(model, data)
     yaws, tilts = [], []
     steps = int(seconds / TIMESTEP)
     for k in range(steps):
@@ -279,7 +292,10 @@ def run_trick(policy_path: str, kind: str, yaw_cmd: float, seconds: float,
             airborne += 1 if not (l or r) else 0
         wz = _yaw_rate(model, data)
         yaws.append(wz)
-        yaw_total += abs(wz) * TIMESTEP
+        cur_yaw = _yaw_angle(model, data)
+        d_yaw = (cur_yaw - prev_yaw + math.pi) % (2 * math.pi) - math.pi
+        net_yaw += d_yaw
+        prev_yaw = cur_yaw
         tilts.append(_trunk_tilt_deg(model, data))
         if data.xpos[trunk][2] < 0.05:
             print(f"FELL at t={k * TIMESTEP:.1f}s")
@@ -291,8 +307,11 @@ def run_trick(policy_path: str, kind: str, yaw_cmd: float, seconds: float,
     print(f"  longest unbroken     : {best_run * TIMESTEP:.2f}s")
     print(f"double-support         : {both / n * 100:.0f}%")
     print(f"airborne               : {airborne / n * 100:.0f}%")
-    print(f"mean |yaw rate|        : {float(np.mean(np.abs(yaws))):.2f} rad/s")
-    print(f"total rotation         : {yaw_total / (2 * math.pi):.1f} revolutions")
+    print(f"mean |yaw rate|        : {float(np.mean(np.abs(yaws))):.2f} rad/s "
+          f"(magnitude only — oscillation inflates this)")
+    print(f"mean SIGNED yaw rate   : {float(np.mean(yaws)):+.2f} rad/s")
+    print(f"NET rotation           : {net_yaw / (2 * math.pi):+.2f} revolutions "
+          f"{'(SPINNING)' if abs(net_yaw) > 2 * math.pi else '(NOT actually rotating)'}")
     print(f"mean / max trunk tilt  : {float(np.mean(tilts)):.0f}° / {max(tilts):.0f}°")
     print(f"upright at end         : "
           f"{'yes' if _trunk_tilt_deg(model, data) < 30 else 'NO — ended fallen'}")

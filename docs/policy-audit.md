@@ -3,11 +3,14 @@
 An adversarial re-examination of every claim made during the overnight training
 pass, using multi-condition sweeps rather than single rollouts.
 
-**Headline: two of the four claimed successes did not survive.** The headstand
-was a faceplant that satisfied a badly-chosen metric, and the "one-leg stand
-doesn't transfer" diagnosis was itself wrong — the policy never learned the
-skill under *either* actuator model. Both were caught by looking at behaviour
-rather than at rewards, and the headstand specifically by watching the video.
+**Headline: three of the four claimed successes did not survive.** The headstand
+was a faceplant, the spin was a vibration, and the "one-leg doesn't transfer"
+diagnosis was itself wrong. Only the sprint survived, and its headline number is
+36% optimistic.
+
+All three were caught the same way: by measuring the thing the claim is about
+rather than the quantity the reward happened to use. Two were caught because a
+human looked at the video and the picture disagreed with the number.
 
 ## Method
 
@@ -46,7 +49,8 @@ A criterion PASSES only if the lower bound of its 95% interval is >= 80%.
 | 1 | sprint reaches 0.758 m/s, +69% over the 0.449 baseline | **partially verified — the magnitude is optimistic** | robust: 8/8 upright in every in-training condition, 82% overall (CI 75-87%). But 0.758 is a POSITION-SERVO number. Under BAM at matched command the same comparison is 0.371 vs 0.254 = **+46%**, not +69% |
 | 2 | sprint-fastest "drifts, can't steer" | **verified** | passes the straightness criterion in 12/152 = **8%** (CI 5-13%) |
 | 3 | the steering fine-tune improved steering at a speed cost | **verified**, and understated | straightness 8% -> **76%** (CI 69-82%); speed 82% -> 78% |
-| 4 | spin-two-leg is genuine: 12.5 rev, never falls | **verified** | 91% no-fall (CI 85-94%), 95% rate >= 3 rad/s; **8/8 in every in-training condition** |
+| 4 | **spin-two-leg turns 12.5 revolutions** | **CONTRADICTED** | integrated yaw ANGLE moves **0.04 revolutions in 10 s**. Mean signed yaw rate +0.03 rad/s against a mean \|yaw rate\| of 6.48. It oscillates its yaw axis; it does not rotate. Frames 0.24 s apart — a quarter-turn at the claimed rate — are visually identical |
+| 4b | spin-two-leg is stable and robust | **verified** | 91% no-fall (CI 85-94%), 8/8 in every in-training condition, 2° tilt. It is a very stable non-rotation |
 | 5 | **headstand holds 11.68 s** | **CONTRADICTED** | it is a head-and-hips tripod: 2.91 N on the head, 4.29 N across both hips, trunk 3.4 cm off the floor, tilt 72°, actuator effort 1.6% |
 | 6 | one-leg "trains but doesn't transfer (actuator gap)" | **CONTRADICTED** | under BAM in the training env: **0/16 envs hold >= 2 s** at both iter 750 and 1250. It fails under both actuators — the skill was never learned |
 | 7 | jump-highest reaches 2.6-2.9 cm but falls | **verified** | 70% reach >= 2 cm; **0/152 end upright** (CI 0-2%) |
@@ -70,13 +74,34 @@ joint saturation (0.63% vs 2.37%), jitter (0.16 vs 0.23), current margin (works
 to 1.30 A vs 1.40 A), and commands far less extreme joint targets
 ([-0.65, 0.56] vs [-5.42, 1.56]). It is 21% slower and that is the whole cost.
 
-### spin-two-leg — **passes, with one hardware caveat**
+### spin-two-leg — **contradicted: it shakes, it does not spin**
 
-91% no-fall, 95% rate, 8/8 in every in-training condition, and robust to battery
-sag where the sprint is not. **But 36.8% joint saturation**: over a third of
-control steps have a joint within 5% of its mechanical limit. AGENTS.md warns
-about exactly this, and a saturated joint has no authority left to react. Not
-disqualifying in sim; it is the first thing to check on hardware.
+The worst error in the overnight pass, and the most instructive.
+
+| quantity | value |
+|---|---|
+| mean \|yaw rate\| (what was reported) | 6.48 rad/s |
+| mean SIGNED yaw rate | +0.03 rad/s |
+| **integrated net yaw angle, 10 s** | **+0.27 rad = 0.04 revolutions** |
+
+Both spin rewards used `wz.abs()`. So did the eval's revolution counter, which
+summed `|yaw rate| * dt` — a back-and-forth shake accumulates "rotation" it
+never performed, which is how a policy that turns 0.04 revolutions scored 12.5.
+Reward and metric shared the same blind spot, so they corroborated each other
+perfectly and both were wrong.
+
+The video is what broke the tie: frames 0.24 s apart, which should differ by a
+quarter turn at 6.5 rad/s, are indistinguishable.
+
+Fixed by projecting onto the COMMANDED direction in both rewards, so a wrong-way
+or back-and-forth yaw earns nothing and only net rotation accumulates; and by
+counting revolutions from the integrated yaw ANGLE in both evals. A test asserts
+a full shake cycle nets to zero.
+
+The stability finding stands on its own: 91% no-fall, 8/8 in every in-training
+condition, 2° tilt. It is a very stable non-rotation. It also parks a joint
+within 5% of a limit on **36.8% of control steps**, which AGENTS.md warns about
+and which is the first thing to check if it is ever put on hardware.
 
 ### headstand — **contradicted, retraining**
 
