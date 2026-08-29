@@ -379,7 +379,28 @@ def conditions(scope: str) -> list[Condition]:
             "all": base + inside + beyond}[scope]
 
 
+def _servo_path_warning() -> None:
+    """Say, every time, that this path is the biased one.
+
+    Measured against the BAM actuator at a matched command: this path reports
+    0.532 m/s where BAM gives 0.314 for the same ONNX, and it scored the fixed
+    spin at 73% no-fall where BAM gives 100%. It is wrong in DIFFERENT
+    DIRECTIONS for different behaviours, so there is no correction factor —
+    only a reason to quote `bam_eval.py` instead.
+
+    This path still earns its keep for what BAM cannot do cheaply: recording
+    video, and sweeping friction / mass / current / sensor faults per trial.
+    """
+    print(
+        "\n  NOTE: position-servo actuator (infer_policy's approximation).\n"
+        "  Speeds here run ~36% HIGH and spin stability ~25% LOW versus BAM.\n"
+        "  For numbers to quote, use: uv run scripts/bam_eval.py\n",
+        file=sys.stderr,
+    )
+
+
 def main() -> int:
+    _servo_path_warning()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--policy", required=True)
     ap.add_argument("--behavior", required=True, choices=list(ACCEPTANCE))

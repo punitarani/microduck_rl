@@ -88,6 +88,30 @@ L40S 1.44 s/iter. Against the 4000–6000 iterations a gait needs (see
 [AGENTS.md](AGENTS.md)), $10 is enough for one — with less margin than the
 "1–2 h" above suggests.
 
+### Evaluating a policy
+
+**Use `scripts/bam_eval.py` for any number you intend to quote.** It runs the
+policy inside the mjlab env, so the actuator is not a model of the training
+actuator — it IS the `BamActuator` training uses — and parallel envs give every
+figure a confidence interval.
+
+```bash
+uv run scripts/bam_eval.py --policy p.onnx --behavior sprint          # criteria + CIs
+uv run scripts/bam_eval.py --policy p.onnx --behavior sprint --sweep  # DR off/on, command sweep
+```
+
+`scripts/eval_sprint_jump.py` and `scripts/robustness_eval.py` run through
+`infer_policy`, which models the XL330 as a position servo with a force clip.
+Measured against BAM on the same ONNX, that path reports speeds ~36% HIGH and
+scored a spin's stability ~25% LOW — it is wrong in *different directions* for
+different behaviours, so there is no correction factor. Both now print a warning
+saying so. They remain the right tool for what BAM cannot do cheaply: recording
+video, and sweeping friction / mass / battery / sensor faults per trial, where
+comparisons ACROSS conditions are what matter.
+
+See [docs/policy-audit.md](docs/policy-audit.md) for the measurements behind all
+of this.
+
 ## Tasks
 
 `uv run list-envs` prints the live registry. Flat/Rough variants exist where noted.

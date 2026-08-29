@@ -29,7 +29,9 @@ Two knobs matter for a fair comparison and both are explicit:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
+import io
 import math
 import sys
 from pathlib import Path
@@ -102,7 +104,10 @@ def run(policy: str, behavior: str, envs: int, seconds: float,
         cmd: tuple[float, float, float] | None, no_dr: bool) -> dict:
     from mjlab_microduck.tasks import mdp as microduck_mdp
 
-    env = build_env(behavior, envs, no_dr)
+    # mjlab prints manager tables on every construction; a sweep builds one env
+    # per row and the tables bury the results.
+    with contextlib.redirect_stdout(io.StringIO()):
+        env = build_env(behavior, envs, no_dr)
     sess = ort.InferenceSession(policy, providers=["CPUExecutionProvider"])
     iname = sess.get_inputs()[0].name
     robot = env.scene["robot"]
@@ -188,6 +193,35 @@ CRITERIA = {
 }
 
 
+def run_sweep(a) -> int:
+    """DR off vs on, plus a command sweep for sprint.
+
+    These are the axes mjlab exposes cleanly. Per-axis physical perturbation
+    (friction, mass, current limit, sensor faults) stays on
+    `robustness_eval.py`: mjlab simulates through a Warp model built at
+    construction, so mutating `env.sim.mj_model` afterwards would not reliably
+    reach the simulation and a sweep built on it would silently report the
+    unperturbed number. The servo path's ABSOLUTE values are biased, but its
+    comparisons ACROSS conditions are still the honest way to find which
+    perturbation breaks a policy.
+    """
+    cmds = ([(0.3, 0, 0), (0.45, 0, 0), (0.6, 0, 0), (0.75, 0, 0)]
+            if a.behavior == "sprint" else [BEHAVIOR[a.behavior][3]])
+    print(f"\n{Path(a.policy).name}  behavior={a.behavior}  BAM  "
+          f"{a.envs} envs x {a.seconds:.0f}s\n")
+    print(f"{'DR':>4} {'cmd':>18} {'vx':>18} {'|net rev|':>10} {'no-fall':>8} {'tilt':>6}")
+    print("-" * 70)
+    for no_dr in (True, False):
+        for cmd in cmds:
+            r = run(a.policy, a.behavior, a.envs, a.seconds, cmd, no_dr)
+            vx, lo, hi = _mean_ci(list(r["vx"]))
+            nf = int((~r["fell"]).sum())
+            print(f"{'off' if no_dr else 'on':>4} {str(cmd):>18} "
+                  f"{vx:+.3f} [{lo:+.3f},{hi:+.3f}] {np.abs(r['net_rev']).mean():>10.2f} "
+                  f"{nf:>4}/{len(r['fell']):<3} {r['tilt_max'].mean():>6.1f}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--policy", required=True)
@@ -199,7 +233,12 @@ def main() -> int:
                     help="let the env sample commands instead of forcing one")
     ap.add_argument("--no-dr", action="store_true",
                     help="strip randomisation events to isolate the actuator")
+    ap.add_argument("--sweep", action="store_true",
+                    help="run DR off and DR on, and (for sprint) a command sweep")
     a = ap.parse_args()
+
+    if a.sweep:
+        return run_sweep(a)
 
     cmd = None
     if not a.sampled_cmd:

@@ -508,3 +508,65 @@ def test_spin_rewards_require_net_rotation_not_oscillation(monkeypatch):
     _Asset.data.root_link_ang_vel_w = torch.tensor([[0.0, 0.0, -3.0]])
     back = microduck_mdp.spin_progress(env, asset_cfg=cfg).item()
     assert abs(fwd + back) < 1e-6, "a full shake cycle must net to zero"
+
+
+# ── headstand as a balancing task ────────────────────────────────────────────
+
+
+def test_headstand_is_configured_as_balancing_not_pose_holding():
+    """Two runs failed paying only for BEING in the posture: headstand_hold read
+    0.0000 for 2300 straight iterations because the state is unreachable by
+    accident. A balance term (pays for correcting a lean) and a reverse-
+    curriculum spawn (starts episodes inside the state) are what make it
+    learnable, and both must be present."""
+    cfg = make_microduck_headstand_env_cfg()
+    assert "headstand_balance" in cfg.rewards, "no term pays for correcting a lean"
+    assert cfg.rewards["headstand_balance"].weight > 0
+    assert "spawn_headstand" in cfg.events, "policy never visits the balance state"
+    assert cfg.events["spawn_headstand"].params["fraction"] > 0.0
+    # Not ALL episodes, or the entry phase is never trained.
+    assert cfg.events["spawn_headstand"].params["fraction"] < 1.0
+
+
+def test_headstand_spawn_is_perturbed():
+    """An inverted pendulum released exactly at its fixed point needs no control
+    at all, so a noiseless spawn would train nothing."""
+    p = make_microduck_headstand_env_cfg().events["spawn_headstand"].params
+    assert p["tilt_noise_deg"] > 0.0 and p["joint_noise"] > 0.0
+
+
+def test_headstand_spawn_pose_matches_the_solved_equilibrium():
+    """The spawn is the pose the static solver proved balanced and torque-
+    feasible, not a guess. If the solver is rerun and disagrees, this fails."""
+    from mjlab_microduck.tasks.mdp import (
+        HEADSTAND_SPAWN_JOINTS,
+        HEADSTAND_SPAWN_QUAT,
+        HEADSTAND_SPAWN_Z,
+    )
+
+    assert HEADSTAND_SPAWN_Z == pytest_approx(0.172)
+    assert HEADSTAND_SPAWN_QUAT == (0.0, 0.0, 1.0, 0.0)  # 180° pitch
+    assert HEADSTAND_SPAWN_JOINTS["left_hip_pitch"] == HEADSTAND_SPAWN_JOINTS["right_hip_pitch"]
+    assert HEADSTAND_SPAWN_JOINTS["neck_pitch"] > 0
+
+
+def pytest_approx(v, tol=1e-6):
+    class _A:
+        def __eq__(self, other):
+            return abs(other - v) < tol
+    return _A()
+
+
+def test_headstand_balance_progress_pays_for_reducing_lean(monkeypatch):
+    """Shrinking the trunk-over-head offset must pay; growing it must charge."""
+    err = {"v": 0.10}
+    monkeypatch.setattr(microduck_mdp, "_headstand_balance_error",
+                        lambda e, h, a: torch.tensor([err["v"]]))
+    env = _FakeEnv(z=[0.1], airborne=[False])
+    kw = dict(head_cfg=None, asset_cfg=None)
+
+    microduck_mdp.headstand_balance_progress(env, **kw)   # prime
+    err["v"] = 0.06
+    assert microduck_mdp.headstand_balance_progress(env, **kw).item() > 0
+    err["v"] = 0.11
+    assert microduck_mdp.headstand_balance_progress(env, **kw).item() < 0

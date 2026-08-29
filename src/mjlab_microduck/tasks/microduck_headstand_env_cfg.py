@@ -25,16 +25,32 @@ Two terms, mirroring what the other tricks needed:
   already demonstrated that an instantaneous gate gets satisfied by passing
   through it rather than by holding it.
 
-Honest expectation: hard. An 800 g biped with 14 low-torque hobby servos and a
-head that is ~38% of its mass has to invert and then balance on a small contact
-patch. Run 1 proved it can get inverted; whether it can STACK and hold there is
-what run 2 tests.
+**This is a BALANCING task, not a pose task**, and getting that wrong cost two
+runs. `scripts/headstand_feasibility.py` settled the physics: a balanced,
+stacked, torque-feasible pose exists (CoM offset 0.00 cm, 13.7 cm stack, peak
+0.136 Nm against a 0.641 Nm ceiling — the robot has 4.7x the strength it needs),
+but it rests on ONE contact point and collapses in every open-loop settle trial.
+It is an inverted pendulum.
+
+Runs 1 and 2 both paid for BEING in the posture. Nothing paid for the corrective
+control that keeps you there, and the posture is not reachable by accident, so
+`headstand_hold` went unsatisfied for 2300 straight iterations. Two changes
+follow from that:
+
+- `headstand_balance_progress` pays for every metre of lean REMOVED, which is
+  dense from the first frame and is what a pendulum controller actually does.
+- `reset_to_headstand` spawns half of all episodes already balanced, using the
+  solved equilibrium with noise on top. This is AGENTS.md's reverse-curriculum
+  prescription for "learns the start, never the last mile": the policy currently
+  never visits the balance state, so it gets no on-policy data there. Entering a
+  headstand from standing is a separate and much harder problem; the remaining
+  half of episodes still train it.
 """
 
 import dataclasses
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.managers import CurriculumTermCfg, RewardTermCfg
+from mjlab.managers import CurriculumTermCfg, EventTermCfg, RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from mjlab_microduck.robot.microduck_constants import MICRODUCK_STANDUP_ROBOT_CFG
@@ -63,6 +79,8 @@ HEADSTAND_HOLD_TARGET_S = 2.0
 HEADSTAND_PROGRESS_WEIGHT = 60.0
 HEADSTAND_HOLD_WEIGHT = 8.0
 HEADSTAND_METRIC_WEIGHT = 0.02  # readable in logs; a weight-0 metric logs 0.0000
+HEADSTAND_BALANCE_WEIGHT = 120.0  # metres of lean removed; the dense signal
+HEADSTAND_SPAWN_FRACTION = 0.5
 
 
 def make_microduck_headstand_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -119,6 +137,17 @@ def make_microduck_headstand_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
         weight=HEADSTAND_STACK_WEIGHT,
         params=geom,
     )
+    # The term both earlier designs lacked: pay for CORRECTING a lean.
+    cfg.rewards["headstand_balance"] = RewardTermCfg(
+        func=microduck_mdp.headstand_balance_progress,
+        weight=HEADSTAND_BALANCE_WEIGHT,
+        params={"head_cfg": head},
+    )
+    cfg.rewards["balance_err_m"] = RewardTermCfg(
+        func=microduck_mdp.headstand_balance_metric,
+        weight=HEADSTAND_METRIC_WEIGHT,
+        params={"head_cfg": head},
+    )
     cfg.rewards["inversion_m"] = RewardTermCfg(
         func=microduck_mdp.headstand_inversion_metric,
         weight=HEADSTAND_METRIC_WEIGHT,
@@ -131,6 +160,14 @@ def make_microduck_headstand_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
         del cfg.terminations["fell_over"]
 
     if not play:
+        # Reverse curriculum: start half the episodes inside the balance state,
+        # which the policy otherwise never reaches and so never learns to hold.
+        cfg.events["spawn_headstand"] = EventTermCfg(
+            func=microduck_mdp.reset_to_headstand,
+            mode="reset",
+            params={"fraction": HEADSTAND_SPAWN_FRACTION,
+                    "joint_noise": 0.03, "tilt_noise_deg": 4.0},
+        )
         cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
             func=microduck_mdp.reward_weight,
             params={

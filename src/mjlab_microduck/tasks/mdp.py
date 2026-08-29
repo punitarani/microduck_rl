@@ -7713,3 +7713,139 @@ def headstand_stack_progress(
     delta = pot - env._headstack_prev
     env._headstack_prev = pot.clone()
     return delta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Headstand, reformulated as BALANCING rather than pose-holding.
+#
+# `scripts/headstand_feasibility.py` settled what the two failed runs could not:
+# a balanced, stacked, torque-feasible inverted pose EXISTS — CoM offset 0.00 cm,
+# 13.7 cm stack, peak 0.136 Nm against a 0.641 Nm ceiling, so the robot has 4.7x
+# the strength it needs. It rests on ONE contact point and collapses in every
+# open-loop settle trial. A headstand here is an inverted pendulum.
+#
+# Both previous reward designs paid for BEING in the posture. Nothing paid for
+# the corrective control that keeps you there, and the posture is not reachable
+# by accident, so the stacking gate went unsatisfied for 2300 iterations. This
+# pays for the correction and starts episodes inside the balance state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The solved equilibrium, from headstand_feasibility.py. Root is pitched 180°
+# with the head resting on the floor at z = 0.172.
+HEADSTAND_SPAWN_JOINTS = {
+    "neck_pitch": 0.568, "head_pitch": -0.321,
+    "left_hip_pitch": -0.679, "left_knee": 0.339, "left_ankle": 0.034,
+    "right_hip_pitch": -0.679, "right_knee": 0.339, "right_ankle": 0.034,
+}
+HEADSTAND_SPAWN_Z = 0.172
+HEADSTAND_SPAWN_QUAT = (0.0, 0.0, 1.0, 0.0)  # 180° pitch
+
+
+def reset_to_headstand(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    fraction: float = 0.5,
+    joint_noise: float = 0.03,
+    tilt_noise_deg: float = 4.0,
+) -> None:
+    """Spawn a FRACTION of episodes already balanced on the head.
+
+    The reverse-curriculum spawn AGENTS.md prescribes for "learns the start,
+    never the last mile". The policy currently never visits the balance state,
+    so it gets no on-policy data there and cannot learn the corrections that
+    hold it; entering a headstand from standing is a separate and much harder
+    problem. Starting inside the state makes the balance learnable first.
+
+    The remaining envs start normally, so the entry phase still gets trained and
+    the policy does not simply forget how to stand.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    n = int(env_ids.shape[0])
+    if n == 0 or fraction <= 0.0:
+        return
+    pick = env_ids[torch.rand(n, device=env.device) < fraction]
+    k = int(pick.shape[0])
+    if k == 0:
+        return
+
+    pose = torch.zeros(k, 7, device=env.device)
+    pose[:, :2] = asset.data.root_link_pos_w[pick, :2]
+    pose[:, 2] = HEADSTAND_SPAWN_Z
+    quat = torch.tensor(HEADSTAND_SPAWN_QUAT, device=env.device).repeat(k, 1)
+    if tilt_noise_deg > 0.0:
+        # Perturb the spawn so the policy has to CORRECT rather than memorise a
+        # single equilibrium — an inverted pendulum released exactly at its
+        # fixed point needs no control at all.
+        ang = torch.deg2rad(
+            (torch.rand(k, device=env.device) * 2 - 1) * tilt_noise_deg) * 0.5
+        axis = torch.randn(k, 3, device=env.device)
+        axis = axis / (axis.norm(dim=1, keepdim=True) + 1e-9)
+        dq = torch.cat([torch.cos(ang).unsqueeze(1),
+                        axis * torch.sin(ang).unsqueeze(1)], dim=1)
+        w1, v1 = quat[:, :1], quat[:, 1:]
+        w2, v2 = dq[:, :1], dq[:, 1:]
+        quat = torch.cat([w1 * w2 - (v1 * v2).sum(1, keepdim=True),
+                          w1 * v2 + w2 * v1 + torch.cross(v1, v2, dim=1)], dim=1)
+    pose[:, 3:] = quat
+    asset.write_root_link_pose_to_sim(pose, env_ids=pick)
+    asset.write_root_link_velocity_to_sim(torch.zeros(k, 6, device=env.device),
+                                          env_ids=pick)
+
+    joint_pos = asset.data.joint_pos[pick].clone()
+    for name, target in HEADSTAND_SPAWN_JOINTS.items():
+        ids, _ = asset.find_joints(name)
+        if ids:
+            joint_pos[:, ids[0]] = target
+    if joint_noise > 0.0:
+        joint_pos += torch.randn_like(joint_pos) * joint_noise
+    asset.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos),
+                                   env_ids=pick)
+
+
+def _headstand_balance_error(env, head_cfg: SceneEntityCfg,
+                             asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Horizontal distance from the trunk to the head — the tipping error.
+
+    For an inverted pendulum pivoting on the head, the trunk sitting directly
+    over the pivot IS balance, and the horizontal offset is exactly the quantity
+    a controller has to drive to zero.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    head_xy = asset.data.site_pos_w[:, head_cfg.site_ids[0], :2]
+    trunk_xy = asset.data.root_link_pos_w[:, :2]
+    return torch.nan_to_num(torch.linalg.norm(trunk_xy - head_xy, dim=1), nan=1.0)
+
+
+def headstand_balance_progress(
+    env: ManagerBasedRlEnv,
+    head_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    ceiling: float = 0.12,
+) -> torch.Tensor:
+    """Potential-based Δ(-tipping error): pays for CORRECTING a lean.
+
+    This is the term both previous designs lacked. `headstand_hold` pays for
+    already being balanced, which is unreachable by accident and therefore never
+    paid out; this pays for every metre of lean removed, which is dense from the
+    first frame and is what an inverted pendulum controller actually does.
+    """
+    err = torch.clamp(_headstand_balance_error(env, head_cfg, asset_cfg), max=ceiling)
+    if not hasattr(env, "_hs_balance_prev") or env._hs_balance_prev.shape[0] != err.shape[0]:
+        env._hs_balance_prev = err.clone()
+    fresh = env.episode_length_buf <= 1
+    env._hs_balance_prev[fresh] = err[fresh]
+    delta = env._hs_balance_prev - err  # shrinking error pays
+    env._hs_balance_prev = err.clone()
+    return delta
+
+
+def headstand_balance_metric(
+    env: ManagerBasedRlEnv,
+    head_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Tipping error in metres. Metric term — small but NON-ZERO weight."""
+    return _headstand_balance_error(env, head_cfg, asset_cfg)
