@@ -19,6 +19,24 @@ from .microduck_velocity_env_cfg import (
     make_microduck_velocity_env_cfg,
     MicroduckRlCfg,
 )
+from .microduck_sprint_env_cfg import (
+    make_microduck_sprint_env_cfg,
+    MicroduckSprintRlCfg,
+)
+from .microduck_jump_env_cfg import (
+    make_microduck_jump_env_cfg,
+    MicroduckJumpRlCfg,
+)
+from .microduck_headstand_env_cfg import (
+    make_microduck_headstand_env_cfg,
+    MicroduckHeadstandRlCfg,
+)
+from .microduck_tricks_env_cfg import (
+    make_microduck_trick_env_cfg,
+    MicroduckOneLegStandRlCfg,
+    MicroduckSpinTwoLegRlCfg,
+    MicroduckSpinOneLegRlCfg,
+)
 from .microduck_standup_env_cfg import (
     make_microduck_standup_env_cfg,
     MicroduckStandUpRlCfg,
@@ -77,6 +95,48 @@ register_mjlab_task(
     rl_cfg=MicroduckRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# Sprint — the walking recipe with a forward-speed curriculum, to find the
+# straight-line ceiling instead of assuming it.
+register_mjlab_task(
+    task_id="Mjlab-Sprint-Flat-MicroDuck",
+    env_cfg=make_microduck_sprint_env_cfg(),
+    play_env_cfg=make_microduck_sprint_env_cfg(play=True),
+    rl_cfg=MicroduckSprintRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Jump — maximise peak trunk height in a genuine flight phase (both feet off).
+register_mjlab_task(
+    task_id="Mjlab-Jump-Flat-MicroDuck",
+    env_cfg=make_microduck_jump_env_cfg(),
+    play_env_cfg=make_microduck_jump_env_cfg(play=True),
+    rl_cfg=MicroduckJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Headstand — the one trick that needs the all-collisions robot.
+register_mjlab_task(
+    task_id="Mjlab-Headstand-Flat-MicroDuck",
+    env_cfg=make_microduck_headstand_env_cfg(),
+    play_env_cfg=make_microduck_headstand_env_cfg(play=True),
+    rl_cfg=MicroduckHeadstandRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Tricks — one-leg balance and spins, all on the velocity base.
+for _trick, _tid, _rl in (
+    ("one_leg_stand", "Mjlab-OneLegStand-Flat-MicroDuck", MicroduckOneLegStandRlCfg),
+    ("spin_two_leg", "Mjlab-SpinTwoLeg-Flat-MicroDuck", MicroduckSpinTwoLegRlCfg),
+    ("spin_one_leg", "Mjlab-SpinOneLeg-Flat-MicroDuck", MicroduckSpinOneLegRlCfg),
+):
+    register_mjlab_task(
+        task_id=_tid,
+        env_cfg=make_microduck_trick_env_cfg(_trick),
+        play_env_cfg=make_microduck_trick_env_cfg(_trick, play=True),
+        rl_cfg=_rl,
+        runner_cls=MicroduckOnPolicyRunner,
+    )
 
 register_mjlab_task(
     task_id="Mjlab-Velocity-Rough-MicroDuck",

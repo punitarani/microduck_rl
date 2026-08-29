@@ -5540,6 +5540,53 @@ def pose_command_range_curriculum(
     return torch.tensor(max_abs)
 
 
+def twist_command_range_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    range_stages: list[dict],
+) -> torch.Tensor:
+    """Ramp a UniformVelocityCommand's lin/ang ranges over training.
+
+    The pose-command twin above sets `cfg.ranges` wholesale because a pose
+    command's ranges are a plain tuple; a velocity command's ranges are an
+    object with named fields, so this sets the fields it is given and leaves
+    the rest alone.
+
+    range_stages: list of {step: int, lin_vel_x / lin_vel_y / ang_vel_z: (lo, hi)}.
+    The first stage applies before its step; the latest passed stage wins.
+
+    The velocity recipe deliberately has NO such curriculum — a ramp to
+    ang +/-2.0 once outpaced the robot and tracked a reward decline after
+    iter 1000. This exists for the sprint task, where finding the forward-speed
+    ceiling IS the objective; pace the stages and watch
+    `Metrics/twist/error_vel_xy` for the wall.
+    """
+    del env_ids
+
+    term = env.command_manager.get_term(command_name)
+    assert term is not None, f"Command term '{command_name}' not found"
+    ranges = term.cfg.ranges  # type: ignore[attr-defined]
+
+    current = range_stages[0]
+    for stage in range_stages:
+        if env.common_step_counter >= stage["step"]:
+            current = stage
+
+    for field in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
+        if field in current:
+            setattr(ranges, field, tuple(current[field]))
+
+    # Report the largest bound among the fields THIS curriculum ramps, so the
+    # logged number tracks whatever is actually being pushed. Hardcoding
+    # lin_vel_x logged 0.05 for the spin tasks, which ramp ang_vel_z — a metric
+    # that silently describes the wrong axis is worse than none.
+    ramped = [f for f in ("lin_vel_x", "lin_vel_y", "ang_vel_z") if f in current]
+    return torch.tensor(max(
+        (max(abs(b) for b in getattr(ranges, f)) for f in ramped), default=0.0
+    ))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Gait-shaping penalties ported from mjlab_microban (microban velocity recipe).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7186,3 +7233,427 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Jump — maximise peak trunk height during a genuine flight phase.
+#
+# The design problem is that "be high" has a cheap non-jump solution: stand tall
+# on tiptoes. So every positive term here is gated on FLIGHT (no foot contact)
+# and on being upright, which is the state-based gate the playbook asks for
+# rather than a penalty nudge that RL would simply out-earn.
+#
+# The main term pays only for BEATING the episode's own record. Height already
+# achieved is already paid, so a second identical hop pays exactly zero and the
+# only way to earn more is to go higher — "as high as possible" as the literal
+# argmax, with no jackpot to farm and no rate limit needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Trunk z at a full stand, per height_progress's documented ceiling (≈0.117).
+# Heights are measured relative to this, so a term only pays for airtime gained
+# ABOVE standing rather than for standing itself.
+JUMP_STAND_Z = 0.117
+
+
+def _jump_airborne(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    """True where NO foot is touching the ground (both feet off = flight)."""
+    contact = _sensor_any_contact(env, sensor_name)
+    if contact is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return ~contact
+
+
+def _jump_height_now(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    sensor_name: str,
+    tilt_gate_deg: float,
+    takeoff_z: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(qualifying height above stance, flight-and-upright mask).
+
+    Height is credited only while airborne AND upright: a tumble also leaves
+    the ground, and without the tilt gate a face-first launch would score as a
+    jump.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    quat = asset.data.root_link_quat_w
+    cos_tilt = torch.nan_to_num(1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=1.0)
+    upright = cos_tilt > math.cos(math.radians(tilt_gate_deg))
+    ok = _jump_airborne(env, sensor_name) & upright
+    height = torch.clamp(z - takeoff_z, min=0.0) * ok.float()
+    return height, ok
+
+
+def jump_record_progress(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_gate_deg: float = 30.0,
+    takeoff_z: float = JUMP_STAND_Z,
+) -> torch.Tensor:
+    """Δ(episode-best flight height): pays only for a NEW personal best.
+
+    Potential-based on the running maximum, so holding altitude pays zero,
+    repeating a hop pays zero, and only a higher apex pays. Returns metres, so
+    it wants a large weight to carry meaningful reward mass against the
+    inherited regularizer stack (a 3 cm gain is 0.03 raw).
+    """
+    height, _ = _jump_height_now(env, asset_cfg, sensor_name, tilt_gate_deg, takeoff_z)
+    if not hasattr(env, "_jump_record") or env._jump_record.shape[0] != height.shape[0]:
+        env._jump_record = torch.zeros_like(height)
+    fresh = env.episode_length_buf <= 1
+    env._jump_record[fresh] = 0.0
+    delta = torch.clamp(height - env._jump_record, min=0.0)
+    env._jump_record = torch.maximum(env._jump_record, height)
+    return delta
+
+
+def jump_flight_bonus(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_gate_deg: float = 30.0,
+    min_height: float = 0.0,
+) -> torch.Tensor:
+    """1.0 per step while airborne, upright, and at least ``min_height`` up.
+
+    A discovery aid, not the goal: the record term is silent until the robot has
+    already left the ground once, which is a hard thing to stumble into.
+
+    ``min_height`` exists because the unguarded version IS farmable, which a
+    mid-run harvest caught: paying per airborne STEP means N short hops pay the
+    same as one long flight of equal total airtime, and short hops are far
+    easier to find. The result was 75 flights in 15 s with a 20 ms median — 5 Hz
+    vibration, not jumping. Requiring the trunk to be a real distance above
+    stance makes a twitch pay exactly nothing, so the only way to collect is to
+    actually leave the ground.
+    """
+    height, ok = _jump_height_now(env, asset_cfg, sensor_name, tilt_gate_deg, JUMP_STAND_Z)
+    if min_height > 0.0:
+        ok = ok & (height >= min_height)
+    return ok.float()
+
+
+def jump_peak_height(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_gate_deg: float = 30.0,
+    takeoff_z: float = JUMP_STAND_Z,
+) -> torch.Tensor:
+    """Episode-best flight height in metres. Metric only — weight 0.
+
+    What the run is actually trying to maximise, logged so a training curve can
+    be read in centimetres instead of inferred from a Δ-based reward.
+    """
+    height, _ = _jump_height_now(env, asset_cfg, sensor_name, tilt_gate_deg, takeoff_z)
+    record = getattr(env, "_jump_record", None)
+    return height if record is None else torch.maximum(record, height)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tricks — single-support balance and spins.
+#
+# Shared machinery for the trick family. Two ideas do most of the work:
+#
+#   * Per-FOOT contact, not just "any foot". The jump task only needed "are we
+#     airborne", but standing on one leg needs to know WHICH foot, and a reward
+#     that accepts either foot is what lets a policy cheat by alternating.
+#   * Spins are rewarded on yaw RATE, capped. Uncapped |omega| is a jackpot: the
+#     policy throws itself into a tumble because falling spins fastest. The cap
+#     turns "spin as fast as possible" into "reach a brisk rate and hold it",
+#     which is the trick people actually mean.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _feet_contact_pair(env: ManagerBasedRlEnv, sensor_name: str):
+    """(left_down, right_down) booleans.
+
+    The sensor's primary pattern is ordered LEFT foot first, RIGHT second (see
+    the ContactSensorCfg comment in the velocity cfg), so column order is
+    meaningful and this must not be reduced to `.any()`.
+    """
+    if sensor_name not in env.scene.sensors:
+        z = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        return z, z
+    found = env.scene.sensors[sensor_name].data.found
+    flat = found.view(found.shape[0], -1)
+    if flat.shape[1] < 2:  # single combined slot: cannot tell feet apart
+        both = flat[:, 0] > 0
+        return both, both
+    half = flat.shape[1] // 2
+    left = (flat[:, :half] > 0).any(dim=-1)
+    right = (flat[:, half:] > 0).any(dim=-1)
+    return left, right
+
+
+def _upright_mask(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, tilt_gate_deg: float):
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    cos_tilt = torch.nan_to_num(1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=1.0)
+    return cos_tilt > math.cos(math.radians(tilt_gate_deg)), cos_tilt
+
+
+def single_support_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_gate_deg: float = 25.0,
+    min_height: float = 0.10,
+) -> torch.Tensor:
+    """1.0 while EXACTLY one foot is down, upright, and not collapsed.
+
+    The height floor matters more than it looks: a robot that has folded onto
+    one knee also has exactly one foot on the ground, and without a floor that
+    crouch is a cheaper way to satisfy the gate than actually balancing.
+    """
+    left, right = _feet_contact_pair(env, sensor_name)
+    exactly_one = left ^ right
+    upright, _ = _upright_mask(env, asset_cfg, tilt_gate_deg)
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    return (exactly_one & upright & (z > min_height)).float()
+
+
+def double_support_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_gate_deg: float = 25.0,
+    min_height: float = 0.10,
+) -> torch.Tensor:
+    """1.0 while BOTH feet are down, upright, and not collapsed."""
+    left, right = _feet_contact_pair(env, sensor_name)
+    upright, _ = _upright_mask(env, asset_cfg, tilt_gate_deg)
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    return (left & right & upright & (z > min_height)).float()
+
+
+def yaw_rate_capped(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    target_rate: float = 4.0,
+    tilt_gate_deg: float = 30.0,
+) -> torch.Tensor:
+    """min(|yaw rate|, target) / target, zeroed unless upright. In [0, 1].
+
+    Capped on purpose. Uncapped |omega_z| is a jackpot: the fastest way to spin
+    a 25 cm biped is to fall over, and the playbook's own note that this robot
+    tumbles at 3.5-5.5 rad/s NATURALLY means an uncapped term pays most for
+    exactly the failure mode. Capping at a brisk-but-controlled rate makes
+    "spin and stay up" the argmax instead of "spin and go down".
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    wz = torch.nan_to_num(asset.data.root_link_ang_vel_w[:, 2], nan=0.0)
+    upright, _ = _upright_mask(env, asset_cfg, tilt_gate_deg)
+    return (torch.clamp(wz.abs(), max=target_rate) / target_rate) * upright.float()
+
+
+def spin_progress(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_gate_deg: float = 30.0,
+) -> torch.Tensor:
+    """Accumulated |yaw| turned this episode, paid as progress (radians/step).
+
+    Potential-based in the same spirit as the jump record: it pays for turning
+    FURTHER, so holding still pays zero and there is no pose to park in. Kept
+    separate from the rate term so a policy can be rewarded for sustaining
+    rotation without also being paid for the violence of getting there.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    wz = torch.nan_to_num(asset.data.root_link_ang_vel_w[:, 2], nan=0.0)
+    upright, _ = _upright_mask(env, asset_cfg, tilt_gate_deg)
+    return wz.abs() * upright.float() * env.step_dt
+
+
+def jump_flight_payout(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_gate_deg: float = 30.0,
+    takeoff_z: float = JUMP_STAND_Z,
+    ref_height: float = 0.05,
+) -> torch.Tensor:
+    """Pay `peak^2 / ref` ONCE per flight, at the moment of landing.
+
+    The episode-max record term (`jump_record_progress`) maximises the single
+    best jump, and a measured consequence is that the optimal policy jumps once
+    out of the reset transient and then stands still forever — a second jump of
+    the same height pays nothing while still costing impact and action-rate. A
+    policy that only jumps when you reboot it is not deployable.
+
+    Paying per FLIGHT restores the incentive to keep jumping. Squaring keeps
+    height the point rather than frequency: one 4 cm jump pays 4x what a 2 cm
+    jump pays, not 2x, so trading height for repetitions loses. Paid on the
+    landing edge rather than per step so hang time cannot be farmed.
+    """
+    height, ok = _jump_height_now(env, asset_cfg, sensor_name, tilt_gate_deg, takeoff_z)
+    n = height.shape[0]
+    if not hasattr(env, "_jump_flight_peak") or env._jump_flight_peak.shape[0] != n:
+        env._jump_flight_peak = torch.zeros_like(height)
+        env._jump_was_airborne = torch.zeros(n, dtype=torch.bool, device=height.device)
+
+    fresh = env.episode_length_buf <= 1
+    env._jump_flight_peak[fresh] = 0.0
+    env._jump_was_airborne[fresh] = False
+
+    env._jump_flight_peak = torch.maximum(env._jump_flight_peak, height)
+    landed = env._jump_was_airborne & ~ok
+    payout = torch.where(
+        landed,
+        env._jump_flight_peak.pow(2) / max(ref_height, 1e-6),
+        torch.zeros_like(height),
+    )
+    env._jump_flight_peak = torch.where(
+        landed, torch.zeros_like(height), env._jump_flight_peak
+    )
+    env._jump_was_airborne = ok
+    return payout
+
+
+def sustained_single_support(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_gate_deg: float = 25.0,
+    min_height: float = 0.10,
+    hold_target_s: float = 2.0,
+) -> torch.Tensor:
+    """Reward for holding the SAME foot down continuously, in [0, 1].
+
+    `single_support_reward` requires exactly one foot down, and I assumed that
+    ruled out the alternating-feet cheat. It does not: rapidly swapping feet
+    satisfies exactly-one at EVERY instant, so a 12 s rollout scored 88-89%
+    single support with a longest unbroken hold of 0.21 s — a hopping spin
+    wearing a balance task's numbers.
+
+    This tracks WHICH foot is bearing weight and how long it has been the only
+    one. Any switch, any double-support step, and any airborne step resets the
+    clock, so alternating pays ~0 and only genuinely standing on one leg
+    accumulates. Ramped to 1.0 at ``hold_target_s`` so there is gradient the
+    whole way up rather than a cliff at the end.
+    """
+    left, right = _feet_contact_pair(env, sensor_name)
+    upright, _ = _upright_mask(env, asset_cfg, tilt_gate_deg)
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    qualifies = (left ^ right) & upright & (z > min_height)
+    # 0 = left is the support foot, 1 = right.
+    foot = right.long()
+
+    n = foot.shape[0]
+    if not hasattr(env, "_ssup_hold") or env._ssup_hold.shape[0] != n:
+        env._ssup_hold = torch.zeros(n, device=foot.device)
+        env._ssup_foot = torch.full((n,), -1, dtype=torch.long, device=foot.device)
+
+    fresh = env.episode_length_buf <= 1
+    env._ssup_hold[fresh] = 0.0
+    env._ssup_foot[fresh] = -1
+
+    same_foot = qualifies & (foot == env._ssup_foot)
+    env._ssup_hold = torch.where(
+        same_foot,
+        env._ssup_hold + env.step_dt,
+        torch.where(qualifies, torch.full_like(env._ssup_hold, env.step_dt),
+                    torch.zeros_like(env._ssup_hold)),
+    )
+    env._ssup_foot = torch.where(qualifies, foot, torch.full_like(foot, -1))
+    return torch.clamp(env._ssup_hold / max(hold_target_s, 1e-6), max=1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Headstand — invert and hold on the head.
+#
+# Measured as feet-above-head rather than by trunk orientation, because a robot
+# lying on its back is also "inverted" by any tilt measure while going nowhere
+# near a headstand. Feet above head with the head near the floor is a shape only
+# a headstand has.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _headstand_geometry(env, head_cfg: SceneEntityCfg, feet_cfg: SceneEntityCfg):
+    """(inversion, head_height): feet-above-head, and how low the head is."""
+    asset: Entity = env.scene[head_cfg.name]
+    ground = env.scene.terrain.env_origins[:, 2]
+    head_z = torch.nan_to_num(
+        asset.data.site_pos_w[:, head_cfg.site_ids[0], 2] - ground, nan=1.0
+    )
+    feet_z = torch.nan_to_num(
+        asset.data.site_pos_w[:, feet_cfg.site_ids, 2].mean(dim=1) - ground, nan=0.0
+    )
+    return feet_z - head_z, head_z
+
+
+def headstand_progress(
+    env: ManagerBasedRlEnv,
+    head_cfg: SceneEntityCfg,
+    feet_cfg: SceneEntityCfg,
+    ceiling: float = 0.18,
+) -> torch.Tensor:
+    """Potential-based Δ(feet above head): pays for inverting, unfarmable.
+
+    Standing gives about -0.19 (head ~0.20 up, feet on the floor) and a clean
+    headstand about +0.17, so this is a wide, dense gradient across the whole
+    maneuver — which matters because a headstand has no partial credit
+    otherwise: every intermediate pose is just falling over.
+    """
+    inversion, _ = _headstand_geometry(env, head_cfg, feet_cfg)
+    pot = torch.clamp(inversion, max=ceiling)
+    if not hasattr(env, "_headstand_prev") or env._headstand_prev.shape[0] != pot.shape[0]:
+        env._headstand_prev = pot.clone()
+    fresh = env.episode_length_buf <= 1
+    env._headstand_prev[fresh] = pot[fresh]
+    delta = pot - env._headstand_prev
+    env._headstand_prev = pot.clone()
+    return delta
+
+
+def headstand_hold(
+    env: ManagerBasedRlEnv,
+    head_cfg: SceneEntityCfg,
+    feet_cfg: SceneEntityCfg,
+    min_inversion: float = 0.05,
+    max_head_height: float = 0.06,
+    hold_target_s: float = 2.0,
+) -> torch.Tensor:
+    """Sustained credit for actually being in a headstand, in [0, 1].
+
+    Both gates are needed. Feet-above-head alone is satisfied by a robot mid-
+    somersault; requiring the head to be near the floor as well is what makes it
+    a stand rather than a moment of a tumble. Held time is what is paid, for the
+    same reason the one-leg trick pays for holding: an instantaneous gate is
+    satisfied by passing through.
+    """
+    inversion, head_z = _headstand_geometry(env, head_cfg, feet_cfg)
+    ok = (inversion > min_inversion) & (head_z < max_head_height)
+    n = ok.shape[0]
+    if not hasattr(env, "_headstand_hold") or env._headstand_hold.shape[0] != n:
+        env._headstand_hold = torch.zeros(n, device=ok.device)
+    env._headstand_hold[env.episode_length_buf <= 1] = 0.0
+    env._headstand_hold = torch.where(
+        ok, env._headstand_hold + env.step_dt, torch.zeros_like(env._headstand_hold)
+    )
+    return torch.clamp(env._headstand_hold / max(hold_target_s, 1e-6), max=1.0)
+
+
+def headstand_inversion_metric(
+    env: ManagerBasedRlEnv,
+    head_cfg: SceneEntityCfg,
+    feet_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Feet-above-head in metres. Metric term — weight small but NON-ZERO, or
+    Episode_Reward logs the weighted value and it reads 0.0000 forever."""
+    inversion, _ = _headstand_geometry(env, head_cfg, feet_cfg)
+    return inversion
